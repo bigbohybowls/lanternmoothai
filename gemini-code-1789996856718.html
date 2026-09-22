@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Moth DQN Simulation</title>
+  <style>
+    body { background: #050814; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    #stage { position: relative; width: 720px; height: 720px; max-width: 100%; max-height: 80vh; border: 2px solid #2a3563; border-radius: 8px; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #veil { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(5, 8, 20, 0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; }
+    button { background: #c9f56b; color: #050814; border: none; padding: 12px 24px; font-size: 16px; font-weight: bold; border-radius: 4px; cursor: pointer; margin: 8px; }
+    button:disabled { background: #555; color: #888; cursor: not-allowed; }
+    #hud { display: flex; justify-content: space-between; width: 720px; max-width: 100%; padding: 8px 0; font-size: 14px; }
+    #health-bar { width: 100px; height: 12px; background: #2a3563; border-radius: 6px; overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
+    #fill { height: 100%; background: #c9f56b; width: 100%; transition: width 0.1s; }
+    #fill.low { background: #ff5d8f; }
+  </style>
+  <!-- Load TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+</head>
+<body>
+
+  <div id="hud">
+    <div>
+      Score: <span id="score">0</span> 
+      <span id="best" style="margin-left: 12px;">Best 0</span>
+      <span id="death-counter" style="margin-left: 12px;">Deaths: 0</span>
+    </div>
+    <div>
+      Light: 
+      <div id="health-bar"><div id="fill"></div></div>
+    </div>
+  </div>
+
+  <div id="stage">
+    <div id="veil">
+      <h2 style="margin-bottom: 8px;">Moth Reinforcement Learning</h2>
+      <p id="ai-status" style="color: #8a9bb8; font-size: 13px; margin-bottom: 16px;">Loading TensorFlow.js...</p>
+      <button id="go" disabled>Loading...</button>
+    </div>
+    <canvas id="game"></canvas>
+  </div>
+
+  <div style="margin-top: 8px;">
+    <button id="speed-btn">Speed: 1x</button>
+    <button id="greedy-btn">Greedy: off</button>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var stage = $('stage'), canvas = $('game'), ctx = canvas.getContext('2d');
+  var el = {
+    score: $('score'), best: $('best'), deaths: $('death-counter'),
+    fill: $('fill'), aiStatus: $('ai-status'), veil: $('veil'),
+    go: $('go'), speedBtn: $('speed-btn'), greedyBtn: $('greedy-btn')
+  };
+
+  var TAU = Math.PI * 2;
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function wrapAngle(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+  var W = 0, H = 0, DPR = 1, S = 1;
+  var state = 'title';
+  var moth = null, flies = [], bats = [];
+  var score = 0, best = 0, deaths = 0, light = 1;
+  var batTimer = 5, flyWait = 0;
+  var isDying = false, respawnTimer = 0;
+  var recentScores = [];
+
+  var DT = 1 / 60;
+  var simSpeed = 1;
+  var speedOptions = [1, 5, 10, 20, 50];
+  var speedIndex = 0;
+  var simAcc = 0;
+
+  el.speedBtn.addEventListener('click', function () {
+    speedIndex = (speedIndex + 1) % speedOptions.length;
+    simSpeed = speedOptions[speedIndex];
+    el.speedBtn.textContent = 'Speed: ' + simSpeed + 'x';
+  });
+
+  var greedyMode = false;
+  el.greedyBtn.addEventListener('click', function () {
+    greedyMode = !greedyMode;
+    el.greedyBtn.textContent = 'Greedy: ' + (greedyMode ? 'on' : 'off');
+  });
+
+  var TURN_RATES = [-8.5, -4.0, -1.5, 0.0, 1.5, 4.0, 8.5];
+  var NUM_ACTIONS = TURN_RATES.length;
+  var FRAME_SKIP = 4;
+
+  var NUM_RAYS = 12;
+  var RAY_FEATURES = 3;
+  var NUM_BATS_IN_STATE = 2;
+  var BAT_FEATURES = 5;
+  var STATE_DIM = NUM_RAYS * RAY_FEATURES + 3 + NUM_BATS_IN_STATE * BAT_FEATURES + 2;
+
+  var R_FLY = 1.0;
+  var R_BAT_HIT = -0.5;
+  var R_DEATH = -1.0;
+  var R_WALL = -0.02;
+  var R_BAT_NEAR = -0.03;
+  var PHI_SCALE = 0.5;
+
+  var HIDDEN = 128;
+  var GAMMA = 0.98;
+  var LR = 5e-4;
+  var BATCH_SIZE = 64;
+  var MEMORY_MAX = 100000;
+  var WARMUP = 2000;
+  var TRAIN_EVERY = 4;
+  var POLYAK = 0.005;
+  var EPS_START = 1.0, EPS_END = 0.03, EPS_DECAY_STEPS = 40000;
+
+  function resize() {
+    var r = stage.getBoundingClientRect();
+    W = Math.max(1, r.width); H = Math.max(1, r.height);
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    S = clamp(Math.min(W, H) / 720, 0.65, 1.25);
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  function resetWorld() {
+    moth = { x: W / 2, y: H * 0.6, ang: -Math.PI / 2 };
+    flies = []; bats = [];
+    score = 0; light = 1;
+    batTimer = 5; flyWait = 0;
+    isDying = false;
+    curState = null; frameInDecision = 0;
+    for (var i = 0; i < 3; i++) spawnFly();
+  }
+
+  function spawnFly() {
+    flies.push({ x: rand(50, W - 50), y: rand(90, H - 50), a: rand(0, TAU), sp: rand(22, 38) * S, age: 0, life: rand(13, 17) });
+  }
+
+  function spawnBat() {
+    var side = Math.floor(Math.random() * 4), m = 40, x, y;
+    if (side === 0) { x = -m; y = rand(0, H); }
+    else if (side === 1) { x = W + m; y = rand(0, H); }
+    else if (side === 2) { x = rand(0, W); y = -m; }
+    else { x = rand(0, W); y = H + m; }
+    bats.push({ x: x, y: y, a: Math.atan2(moth.y - y, moth.x - x) + rand(-0.5, 0.5), sp: (95 + Math.min(score, 70) * 1.6) * S, age: 0 });
+  }
+
+  function addScore(pts) {
+    score += pts;
+    if (score > best) best = score;
+  }
+
+  function flyReachable(f) { return f.x > 0 && f.x < W && f.y > 20 && f.y < H; }
+  function batInPlay(b) { return b.x > -60 && b.x < W + 60 && b.y > -60 && b.y < H + 60; }
+
+  function nearestFlyDist() {
+    var best = Infinity;
+    for (var i = 0; i < flies.length; i++) {
+      if (!flyReachable(flies[i])) continue;
+      var d = Math.hypot(flies[i].x - moth.x, flies[i].y - moth.y);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function potential() {
+    var d = nearestFlyDist();
+    if (d === Infinity) return 0;
+    var range = 500 * S;
+    return PHI_SCALE * (1 - Math.min(d, range) / range);
+  }
+
+  function wallDist(x, y, cx, cy, maxD) {
+    var t = maxD;
+    if (cx > 1e-6) t = Math.min(t, (W - 15 - x) / cx);
+    else if (cx < -1e-6) t = Math.min(t, (15 - x) / cx);
+    if (cy > 1e-6) t = Math.min(t, (H - 15 - y) / cy);
+    else if (cy < -1e-6) t = Math.min(t, (45 - y) / cy);
+    return Math.max(0, t);
+  }
+
+  function getState() {
+    var s = new Float32Array(STATE_DIM);
+    var maxR = 500 * S;
+    var stepAng = TAU / NUM_RAYS;
+    var ca = Math.cos(moth.ang), sa = Math.sin(moth.ang);
+    var mvx = ca * 300 * S, mvy = sa * 300 * S;
+    var i, o;
+
+    for (i = 0; i < NUM_RAYS; i++) {
+      var ra = moth.ang + i * stepAng;
+      var wd = wallDist(moth.x, moth.y, Math.cos(ra), Math.sin(ra), maxR);
+      s[i * RAY_FEATURES + 2] = 1 - wd / maxR;
+    }
+
+    var near = [];
+    for (var bi = 0; bi < bats.length; bi++) {
+      var b = bats[bi];
+      if (!batInPlay(b)) continue;
+      var dx = b.x - moth.x, dy = b.y - moth.y;
+      var dist = Math.hypot(dx, dy);
+      if (dist >= maxR) continue;
+      var rel = wrapAngle(Math.atan2(dy, dx) - moth.ang);
+      var prox = 1 - dist / maxR;
+      for (i = 0; i < NUM_RAYS; i++) {
+        if (Math.abs(wrapAngle(rel - i * stepAng)) < 0.45 && prox > s[i * RAY_FEATURES]) s[i * RAY_FEATURES] = prox;
+      }
+      near.push({ b: b, dist: dist, rel: rel, prox: prox });
+    }
+
+    var nf = null, nfDist = Infinity, nfRel = 0;
+    for (var fi = 0; fi < flies.length; fi++) {
+      var f = flies[fi];
+      if (!flyReachable(f)) continue;
+      var fdx = f.x - moth.x, fdy = f.y - moth.y;
+      var fd = Math.hypot(fdx, fdy);
+      if (fd >= maxR) { if (fd < nfDist) { nfDist = fd; nf = f; nfRel = wrapAngle(Math.atan2(fdy, fdx) - moth.ang); } continue; }
+      var frel = wrapAngle(Math.atan2(fdy, fdx) - moth.ang);
+      var fprox = 1 - fd / maxR;
+      for (i = 0; i < NUM_RAYS; i++) {
+        if (Math.abs(wrapAngle(frel - i * stepAng)) < 0.45 && fprox > s[i * RAY_FEATURES + 1]) s[i * RAY_FEATURES + 1] = fprox;
+      }
+      if (fd < nfDist) { nfDist = fd; nf = f; nfRel = frel; }
+    }
+
+    o = NUM_RAYS * RAY_FEATURES;
+    if (nf) {
+      s[o] = Math.sin(nfRel);
+      s[o + 1] = Math.cos(nfRel);
+      s[o + 2] = 1 - Math.min(nfDist, maxR) / maxR;
+    }
+    o += 3;
+
+    near.sort(function (p, q) { return p.dist - q.dist; });
+    for (var k = 0; k < NUM_BATS_IN_STATE; k++, o += BAT_FEATURES) {
+      if (k >= near.length) continue;
+      var n = near[k], bb = n.b;
+      var vx = Math.cos(bb.a) * bb.sp - mvx, vy = Math.sin(bb.a) * bb.sp - mvy;
+      s[o] = Math.sin(n.rel);
+      s[o + 1] = Math.cos(n.rel);
+      s[o + 2] = n.prox;
+      s[o + 3] = clamp((vx * ca + vy * sa) / maxR, -1, 1);
+      s[o + 4] = clamp((-vx * sa + vy * ca) / maxR, -1, 1);
+    }
+
+    s[o] = clamp(light, 0, 1);
+    s[o + 1] = Math.min(score, 120) / 120;
+    return s;
+  }
+
+  var net = null, tgt = null, optimizer = null;
+  var totalSteps = 0, trainSteps = 0;
+  var qEma = 0, lossEma = 0, nanFlag = false, nanResets = 0;
+
+  var memS = null, memS2 = null, memA = null, memR = null, memDone = null;
+  var memCount = 0, memPos = 0;
+
+  function makeParams() {
+    var sizes = [STATE_DIM, HIDDEN, HIDDEN, NUM_ACTIONS];
+    var p = [];
+    for (var i = 0; i < sizes.length - 1; i++) {
+      var last = (i === sizes.length - 2);
+      var std = last ? 0.01 : Math.sqrt(2 / sizes[i]);
+      p.push(tf.variable(tf.randomNormal([sizes[i], sizes[i + 1]], 0, std)));
+      p.push(tf.variable(tf.zeros([sizes[i + 1]])));
+    }
+    return p;
+  }
+
+  function forward(p, x) {
+    var h = tf.relu(tf.add(tf.matMul(x, p[0]), p[1]));
+    h = tf.relu(tf.add(tf.matMul(h, p[2]), p[3]));
+    return tf.add(tf.matMul(h, p[4]), p[5]);
+  }
+
+  function buildNetworks() {
+    net = makeParams();
+    tgt = makeParams();
+    for (var i = 0; i < net.length; i++) tgt[i].assign(net[i]);
+    optimizer = tf.train.adam(LR);
+  }
+
+  function resetNetworks() {
+    var old = net.concat(tgt);
+    for (var i = 0; i < old.length; i++) old[i].dispose();
+    if (optimizer && optimizer.dispose) optimizer.dispose();
+    buildNetworks();
+    nanFlag = false; nanResets++; qEma = 0; lossEma = 0;
+  }
+
+  async function initDQN() {
+    try {
+      await tf.ready();
+      memS = new Float32Array(MEMORY_MAX * STATE_DIM);
+      memS2 = new Float32Array(MEMORY_MAX * STATE_DIM);
+      memA = new Int32Array(MEMORY_MAX);
+      memR = new Float32Array(MEMORY_MAX);
+      memDone = new Float32Array(MEMORY_MAX);
+      buildNetworks();
+      tf.tidy(function () { forward(net, tf.zeros([1, STATE_DIM])).dataSync(); });
+      el.go.textContent = 'Start Multi-Ray DQN';
+      el.go.disabled = false;
+    } catch (e) {
+      console.error(e);
+      el.go.textContent = 'TensorFlow.js failed to load';
+    }
+  }
+
+  function currentEpsilon() {
+    if (greedyMode) return 0;
+    return Math.max(EPS_END, EPS_START - (EPS_START - EPS_END) * totalSteps / EPS_DECAY_STEPS);
+  }
+
+  function greedyAction(s) {
+    var q = tf.tidy(function () {
+      return Array.from(forward(net, tf.tensor2d(s, [1, STATE_DIM])).dataSync());
+    });
+    var bestA = 0, bestQ = -Infinity;
+    for (var i = 0; i < q.length; i++) {
+      if (!isFinite(q[i])) { nanFlag = true; return (Math.random() * NUM_ACTIONS) | 0; }
+      if (q[i] > bestQ) { bestQ = q[i]; bestA = i; }
+    }
+    qEma = 0.995 * qEma + 0.005 * bestQ;
+    return bestA;
+  }
+
+  function chooseAction(s) {
+    if (Math.random() < currentEpsilon()) return (Math.random() * NUM_ACTIONS) | 0;
+    var a = greedyAction(s);
+    if (nanFlag) resetNetworks();
+    return a;
+  }
+
+  function remember(s, a, r, s2, done) {
+    memS.set(s, memPos * STATE_DIM);
+    memS2.set(s2, memPos * STATE_DIM);
+    memA[memPos] = a; memR[memPos] = r; memDone[memPos] = done ? 1 : 0;
+    memPos = (memPos + 1) % MEMORY_MAX;
+    if (memCount < MEMORY_MAX) memCount++;
+  }
+
+  function trainStep() {
+    var B = BATCH_SIZE, D = STATE_DIM;
+    var sB = new Float32Array(B * D), s2B = new Float32Array(B * D);
+    var aB = new Int32Array(B), rB = new Float32Array(B), nB = new Float32Array(B);
+    for (var i = 0; i < B; i++) {
+      var k = (Math.random() * memCount) | 0;
+      sB.set(memS.subarray(k * D, (k + 1) * D), i * D);
+      s2B.set(memS2.subarray(k * D, (k + 1) * D), i * D);
+      aB[i] = memA[k]; rB[i] = memR[k]; nB[i] = 1 - memDone[k];
+    }
+
+    var cost = tf.tidy(function () {
+      var s = tf.tensor2d(sB, [B, D]);
+      var s2 = tf.tensor2d(s2B, [B, D]);
+      var actionMask = tf.cast(tf.oneHot(tf.tensor1d(aB, 'int32'), NUM_ACTIONS), 'float32');
+      var r = tf.tensor1d(rB), notDone = tf.tensor1d(nB);
+
+      var nextA = forward(net, s2).argMax(1);
+      var nextMask = tf.cast(tf.oneHot(nextA, NUM_ACTIONS), 'float32');
+      var nextQ = tf.sum(tf.mul(forward(tgt, s2), nextMask), 1);
+      var target = tf.add(r, tf.mul(tf.mul(notDone, nextQ), GAMMA));
+
+      return optimizer.minimize(function () {
+        var qa = tf.sum(tf.mul(forward(net, s), actionMask), 1);
+        return tf.losses.huberLoss(target, qa);
+      }, true, net);
+    });
+
+    trainSteps++;
+    if (trainSteps % 50 === 0) {
+      var lv = cost.dataSync()[0];
+      if (!isFinite(lv)) nanFlag = true; else lossEma = lossEma === 0 ? lv : 0.9 * lossEma + 0.1 * lv;
+    }
+    cost.dispose();
+
+    tf.tidy(function () {
+      for (var j = 0; j < net.length; j++) {
+        tgt[j].assign(tf.add(tf.mul(net[j], POLYAK), tf.mul(tgt[j], 1 - POLYAK)));
+      }
+    });
+    if (nanFlag) resetNetworks();
+  }
+
+  var curState = null, curAction = 3, frameInDecision = 0, decReward = 0, phiStart = 0;
+  var stepReward = 0, stepDone = false;
+
+  function stepPhysics(action) {
+    var r = 0;
+    moth.ang += TURN_RATES[action] * DT;
+
+    light -= (0.05 + Math.min(score, 120) * 0.0006) * DT;
+    var speed = 300 * S;
+    moth.x += Math.cos(moth.ang) * speed * DT;
+    moth.y += Math.sin(moth.ang) * speed * DT;
+
+    if (moth.x < 15 || moth.x > W - 15 || moth.y < 45 || moth.y > H - 15) {
+      r += R_WALL;
+      moth.x = clamp(moth.x, 15, W - 15);
+      moth.y = clamp(moth.y, 45, H - 15);
+    }
+
+    for (var i = flies.length - 1; i >= 0; i--) {
+      var f = flies[i];
+      f.age += DT;
+      f.x += Math.cos(f.a) * f.sp * DT;
+      f.y += Math.sin(f.a) * f.sp * DT;
+      if (f.age >= f.life) { flies.splice(i, 1); continue; }
+      if (Math.hypot(f.x - moth.x, f.y - moth.y) < 26) {
+        flies.splice(i, 1);
+        addScore(1);
+        r += R_FLY;
+        light = Math.min(1, light + 0.3);
+      }
+    }
+
+    if (flies.length < 3) {
+      flyWait -= DT;
+      if (flyWait <= 0) { spawnFly(); flyWait = 0.4; }
+    }
+
+    batTimer -= DT;
+    if (batTimer <= 0) {
+      if (bats.length < 6) spawnBat();
+      batTimer = Math.max(1.1, 3.8 - score * 0.035);
+    }
+    for (var j = bats.length - 1; j >= 0; j--) {
+      var b = bats[j];
+      b.age += DT;
+      b.x += Math.cos(b.a) * b.sp * DT;
+      b.y += Math.sin(b.a) * b.sp * DT;
+      if (b.age > 22) { bats.splice(j, 1); continue; }
+      var bd = Math.hypot(b.x - moth.x, b.y - moth.y);
+      if (bd < 18) {
+        light -= 0.35;
+        r += R_BAT_HIT;
+        b.a += Math.PI;
+      } else if (bd < 60) {
+        r += R_BAT_NEAR * (1 - bd / 60);
+      }
+    }
+
+    stepDone = false;
+    if (light <= 0) { light = 0; stepDone = true; }
+    stepReward = r;
+  }
+
+  function tick() {
+    if (isDying) {
+      respawnTimer -= DT;
+      if (respawnTimer <= 0) start();
+      return;
+    }
+
+    if (frameInDecision === 0) {
+      if (!curState) curState = getState();
+      curAction = chooseAction(curState);
+      phiStart = potential();
+      decReward = 0;
+    }
+
+    stepPhysics(curAction);
+    decReward += stepReward;
+    frameInDecision++;
+
+    if (stepDone || frameInDecision >= FRAME_SKIP) {
+      var next = getState();
+      var r = decReward;
+      if (stepDone) r += R_DEATH - phiStart;
+      else r += GAMMA * potential() - phiStart;
+
+      remember(curState, curAction, r, next, stepDone);
+      totalSteps++;
+      if (memCount >= WARMUP && totalSteps % TRAIN_EVERY === 0) trainStep();
+
+      curState = next;
+      frameInDecision = 0;
+      if (stepDone) gameOver();
+    }
+  }
+
+  function gameOver() {
+    if (isDying) return;
+    isDying = true;
+    deaths++;
+    recentScores.push(score);
+    if (recentScores.length > 50) recentScores.shift();
+    respawnTimer = 0.25;
+  }
+
+  function start() {
+    resetWorld();
+    el.veil.style.display = 'none';
+    state = 'play';
+  }
+
+  el.go.addEventListener('click', start);
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#0e1438';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = '#ff5d8f';
+    for (var bi = 0; bi < bats.length; bi++) {
+      ctx.beginPath(); ctx.arc(bats[bi].x, bats[bi].y, 10, 0, TAU); ctx.fill();
+    }
+
+    ctx.fillStyle = '#c9f56b';
+    for (var fi = 0; fi < flies.length; fi++) {
+      ctx.beginPath(); ctx.arc(flies[fi].x, flies[fi].y, 6, 0, TAU); ctx.fill();
+    }
+
+    if (moth) {
+      ctx.save();
+      ctx.translate(moth.x, moth.y);
+      ctx.rotate(moth.ang + Math.PI / 2);
+      ctx.fillStyle = '#f3ecdc';
+      ctx.beginPath(); ctx.ellipse(-8, -2, 8, 9, -0.35, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(8, -2, 8, 9, 0.35, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#b8935a';
+      ctx.beginPath(); ctx.ellipse(0, 1, 2.6, 8, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function hud() {
+    var avg = 0;
+    for (var i = 0; i < recentScores.length; i++) avg += recentScores[i];
+    avg = recentScores.length ? avg / recentScores.length : 0;
+
+    el.score.textContent = score;
+    el.best.textContent = 'Best ' + best;
+    el.deaths.textContent = 'Deaths: ' + deaths;
+    el.fill.style.width = Math.round(clamp(light, 0, 1) * 100) + '%';
+    el.fill.classList.toggle('low', light < 0.25);
+    el.aiStatus.textContent = 'EPS ' + currentEpsilon().toFixed(2) +
+      ' | AVG50 ' + avg.toFixed(1) +
+      ' | Q ' + qEma.toFixed(2) +
+      ' | MEM ' + memCount +
+      ' | ' + simSpeed + 'X' +
+      (nanResets ? ' | NaN RESETS ' + nanResets : '');
+  }
+
+  var last = 0;
+  function loop(ts) {
+    var elapsed = Math.min(0.1, (ts - last) / 1000 || 0);
+    last = ts;
+    if (state === 'play' && net) {
+      simAcc += elapsed * simSpeed;
+      var t0 = performance.now();
+      while (simAcc >= DT) {
+        tick();
+        simAcc -= DT;
+        if (performance.now() - t0 > 12) { simAcc = 0; break; }
+      }
+    }
+    draw();
+    hud();
+    requestAnimationFrame(loop);
+  }
+
+  resize();
+  resetWorld();
+  window.addEventListener('resize', resize);
+
+  initDQN();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
